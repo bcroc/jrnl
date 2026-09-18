@@ -22,7 +22,9 @@ jrnl                   open $EDITOR to write an entry interactively (TTY only)
 jrnl write <text>      add an entry inline (auto-dated; #tags supported)
 echo <text> | jrnl     add an entry via stdin (also: jrnl <text> when piped)
 jrnl list [n]          show last n entries (default 5)
-jrnl show [date]       show all entries for a date (default today; YYYY-MM-DD)
+jrnl show [date]       show entries for a date (default today; YYYY-MM-DD,
+                       "today", "yesterday", "tomorrow", or "-N" = N days ago)
+jrnl edit [date]       open a day's file in $EDITOR (default today)
 jrnl search <terms>    full-text search; "#tag" searches by tag
 jrnl tags              list all tags with counts
 jrnl --help            print usage
@@ -38,6 +40,9 @@ jrnl search coffee                     # body + tag search
 jrnl search "#work"                    # tag-only search
 jrnl search coffee "#work"             # multiple terms = AND
 jrnl show 2026-09-18                   # view a specific day
+jrnl show yesterday                     # relative dates work
+jrnl show -7                            # a week ago
+jrnl edit yesterday                     # fix or extend a day's file
 jrnl list 10                           # 10 most recent entries
 ```
 
@@ -47,6 +52,9 @@ jrnl list 10                           # 10 most recent entries
 - **Tags**: any `#token` (alphanumeric, `-`, `_`) inside the text is recognized; tags are lowercased and deduplicated. `jrnl search "#tag"` matches entries by tag.
 - **Editor mode** (`jrnl` with no args on a TTY): spawns `$EDITOR`/`$VISUAL` (default `vi`) on a temp draft file via the user's shell, so `EDITOR="code -w"` style values work. Lines beginning with `#:` are instruction lines and are stripped on save. Saving an empty draft writes nothing; a nonzero editor exit saves nothing and propagates the exit code.
 - **Stdin mode**: with piped stdin and no recognized subcommand, the piped text (plus any remaining args) is the entry. Unknown `-options` are rejected instead of saved (e.g. a future `jrnl --flag` can't silently become an entry).
+- **Durability**: entries are written with a single append + `fsync`, so "Saved" means on disk. On write failure the entry text is echoed to stderr so nothing is silently lost.
+- **Warnings**: `.md` files in the journal that contain no parseable entries, and `## ` blocks whose header isn't `## YYYY-MM-DD HH:MM` (with a valid clock time), produce a warning on stderr — corrupt or hand-edited files can't silently vanish from search results.
+- **Editing**: `jrnl edit [date]` opens the day's file in `$EDITOR`/`$VISUAL` (same shell-wrapper behavior as editor mode). After the editor exits, jrnl reports if the number of parseable entries changed and warns about newly unparsable blocks.
 
 ## Storage Layout
 
@@ -95,7 +103,10 @@ TypeScript CLI (no external runtime deps). Pure parsing/tag logic lives in `src/
 | `cmdList`      | One-line summaries of the n most recent entries                            |
 | `cmdTags`      | Aggregate tag counts, sorted by frequency                                  |
 | `cmdShow`      | Full entries for one date                                                  |
+| `cmdEdit`      | Opens the day file in `$EDITOR`, reports entry-count changes on save       |
 | Command router | `switch` on `process.argv[2]` at the bottom of the file; piped non-TTY input without a known subcommand is treated as an entry |
+
+Pure helpers live in `src/parse.ts`: `resolveDate` maps `YYYY-MM-DD` / `today` / `yesterday` / `tomorrow` / `-N` to a date string (used by `show` and `edit`).
 
 ## Development
 
@@ -107,6 +118,5 @@ TypeScript CLI (no external runtime deps). Pure parsing/tag logic lives in `src/
 ## Limitations / Future Ideas
 
 - Search is case-insensitive substring matching, not fuzzy or regex
-- No editing or deleting of existing entries
-- `show` requires exact `YYYY-MM-DD` (no "yesterday" alias)
+- No deleting of existing entries (editing exists via `jrnl edit`)
 - All entries are loaded into memory for each query (fine for personal scale)

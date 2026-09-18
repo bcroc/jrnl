@@ -1,18 +1,14 @@
 #!/usr/bin/env node
-import { mkdirSync, appendFileSync, readFileSync, readSync, existsSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, readFileSync, readSync, existsSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
 
-import { extractTags, matches, parseDayFile, type Entry } from "./parse.js";
+import { extractTags, formatLocalDate, matches, parseDayFile, resolveDate, type Entry } from "./parse.js";
 
 const JOURNAL_DIR = process.env.JOURNAL_DIR ?? join(homedir(), ".journal");
 
-function isoNow(): string {
-  const d = new Date();
-  const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
+const isoNow = () => formatLocalDate(new Date());
 
 function timeNow(): string {
   const d = new Date();
@@ -28,12 +24,29 @@ function dayFile(date = isoNow()): string {
 function parseEntries(): Entry[] {
   if (!existsSync(JOURNAL_DIR)) return [];
   const entries: Entry[] = [];
+  const warned = new Set<string>();
+  const warnOnce = (file: string, msg: string) => {
+    const key = `${file}\n${msg}`;
+    if (!warned.has(key)) {
+      warned.add(key);
+      console.error(`jrnl: warning: ${msg}`);
+    }
+  };
   const walk = (dir: string) => {
     for (const name of readdirSync(dir, { withFileTypes: true })) {
       const full = join(dir, name.name);
       if (name.isDirectory()) walk(full);
       else if (name.name.endsWith(".md")) {
-        entries.push(...parseDayFile(full, readFileSync(full, "utf8")));
+        const content = readFileSync(full, "utf8");
+        const before = entries.length;
+        entries.push(
+          ...parseDayFile(full, content, (header) =>
+            warnOnce(full, `skipping unparsed block in ${full}: "## ${header.slice(0, 60)}" (expected "## YYYY-MM-DD HH:MM")`)
+          )
+        );
+        if (content.trim() && entries.length === before) {
+          warnOnce(full, `${full} contains no journal entries`);
+        }
       }
     }
   };
@@ -72,7 +85,20 @@ function saveEntry(text: string) {
   const tags = extractTags(text);
   let block = `\n## ${isoNow()} ${timeNow()}\n\n${text}\n`;
   if (tags.length) block += `\nTags: ${tags.map((t) => `#${t}`).join(" ")}\n`;
-  appendFileSync(file, block);
+  try {
+    const fd = openSync(file, "a");
+    try {
+      writeSync(fd, block);
+      fsyncSync(fd); // entry is on disk before we report success
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    console.error(`Failed to save entry: ${err instanceof Error ? err.message : String(err)}`);
+    console.error("--- entry text (NOT saved — copy it somewhere safe) ---");
+    console.error(text);
+    process.exit(1);
+  }
   console.log(`Saved to ${file} at ${timeNow()}`);
 }
 
@@ -164,13 +190,42 @@ function cmdTags() {
 }
 
 function cmdShow(args: string[]) {
-  const date = args[0] ?? isoNow();
+  const date = args[0] ? resolveDate(args[0], new Date()) : isoNow();
+  if (!date) {
+    console.error(`Invalid date: ${args[0]} (use YYYY-MM-DD, "today", "yesterday", "tomorrow", or "-N")`);
+    process.exit(1);
+  }
   const hits = parseEntries().filter((e) => e.date === date);
   if (!hits.length) {
     console.log(`No entries on ${date}.`);
     return;
   }
   for (const e of hits) printEntry(e);
+}
+
+function cmdEdit(args: string[]): number {
+  const date = args[0] ? resolveDate(args[0], new Date()) : isoNow();
+  if (!date) {
+    console.error(`Invalid date: ${args[0]} (use YYYY-MM-DD, "today", "yesterday", "tomorrow", or "-N")`);
+    return 1;
+  }
+  const file = dayFile(date);
+  if (!existsSync(file)) {
+    console.log(`No entries on ${date} (${file} does not exist).`);
+    return 1;
+  }
+  const editor = process.env.EDITOR || process.env.VISUAL || "vi";
+  const before = parseDayFile(file, readFileSync(file, "utf8")).length;
+  const status = spawnEditor(editor, file);
+  if (status !== 0) {
+    console.error(`Editor exited with status ${status}; any unsaved changes were not written.`);
+    return status;
+  }
+  const after = parseDayFile(file, readFileSync(file, "utf8"), (header) =>
+    console.error(`jrnl: warning: edited file now has an unparsed block: "## ${header.slice(0, 60)}"`)
+  ).length;
+  if (after !== before) console.log(`${date}: ${before} -> ${after} parseable entr${after === 1 ? "y" : "ies"}`);
+  return 0;
 }
 
 const [, , cmd, ...rest] = process.argv;
@@ -180,7 +235,8 @@ const usage = `jrnl — terminal journal
   jrnl write <text>     add an entry (auto-dated; #tags supported)
   echo <text> | jrnl    add an entry via stdin
   jrnl list [n]         show last n entries (default 5)
-  jrnl show [date]      show all entries for a date (default today)
+  jrnl show [date]      show entries for a date (default today; also "yesterday", "-N")
+  jrnl edit [date]      edit a day's file in $EDITOR (default today)
   jrnl search <terms>   full-text search; "#tag" searches tags
   jrnl tags             list all tags with counts
   jrnl --help           show this help`;
@@ -208,6 +264,12 @@ switch (cmd) {
     break;
   case "show":
     cmdShow(rest);
+    break;
+  case "edit":
+    {
+      const code = cmdEdit(rest);
+      if (code) process.exit(code);
+    }
     break;
   case "search":
     cmdSearch(rest);

@@ -17,14 +17,14 @@ Status: `[ ]` open · `[~]` in progress · `[x]` done
 
 ### Correctness / robustness
 
-- [ ] WB-7 Warn on unparsed blocks — `parseDayFile` silently drops any `## ` block whose header doesn't match `YYYY-MM-DD HH:MM` (torn writes, hand-edited headings), so entries vanish from search/list without a trace. Warn on stderr when a non-empty block is skipped; consider surfacing non-entry `.md` files found in `JOURNAL_DIR`.
-- [ ] WB-8 Durable writes — `appendFileSync` can leave a torn entry on Ctrl-C or disk-full; that entry then fails the header parse (pairs with WB-7). Consider write-temp-then-append, or at least verify a trailing newline before exit.
+- [x] WB-7 Warn on unparsed blocks — done 2026-09-18: `parseDayFile` takes an `onSkipped` callback; `parseEntries` warns (deduped) on stderr for skipped blocks and for `.md` files with no entries. Header now also rejects impossible clock times (`25:99`).
+- [x] WB-8 Durable writes — done 2026-09-18: `saveEntry` writes via `open(O_APPEND)` + `write` + `fsync` before reporting success; on failure it exits 1 after echoing the entry text to stderr so nothing is silently lost.
 
 ### Features
 
-- [ ] WB-9 Relative dates for `show`/`list` — e.g. `jrnl show yesterday`, `show -3d`. Biggest usability win; README lists exact-`YYYY-MM-DD` as a known limitation.
-- [ ] WB-10 `edit` command — currently there is no way to fix a typo in a saved entry. Smallest useful version: `jrnl edit [date]` opens that day's file in `$EDITOR` (reuse the spawnEditor shell-wrapper path).
-- [ ] WB-11 Tags in `list` output — tags appear in `search`/`show` but not `list`; add the `[#tag ...]` segment to list lines.
+- [x] WB-9 Relative dates — done 2026-09-18: `resolveDate` in src/parse.ts supports `YYYY-MM-DD`, `today`, `yesterday`, `tomorrow`, `-N[ d]`; wired into `show` (and `edit`).
+- [x] WB-10 `edit` command — done 2026-09-18: `jrnl edit [date]` opens the day file in `$EDITOR` via the shared `spawnEditor` shell wrapper, reports parseable-entry count changes, warns on newly unparsable blocks, propagates editor exit codes.
+- [x] WB-11 Tags in `list` output — closed as not-a-bug on re-review: `cmdList` already prints the `[#tag ...]` segment (was wrong in the original review).
 
 ### Performance (low priority)
 
@@ -32,7 +32,7 @@ Status: `[ ]` open · `[~]` in progress · `[x]` done
 
 ### Hygiene (minor)
 
-- [ ] WB-13 `jrnl write --flag` treats `--flag` as entry text; decide whether the explicit `write` subcommand should reject dash-args the way the router now does for unknown subcommands.
+- [x] WB-13 `jrnl write --flag` treats `--flag` as entry text — closed as by-design: explicit `write <text>` takes free text; only the *router* (unknown subcommands) rejects dash-args, so future flags can't be swallowed silently.
 
 ## Notes for implementers
 
