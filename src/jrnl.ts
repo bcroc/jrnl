@@ -1,8 +1,10 @@
 #!/usr/bin/env node
 import { mkdirSync, appendFileSync, readFileSync, readSync, existsSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
+
+import { extractTags, matches, parseDayFile, type Entry } from "./parse.js";
 
 const JOURNAL_DIR = process.env.JOURNAL_DIR ?? join(homedir(), ".journal");
 
@@ -23,14 +25,6 @@ function dayFile(date = isoNow()): string {
   return join(JOURNAL_DIR, y, m, `${date}.md`);
 }
 
-interface Entry {
-  date: string;
-  time: string;
-  tags: string[];
-  body: string;
-  file: string;
-}
-
 function parseEntries(): Entry[] {
   if (!existsSync(JOURNAL_DIR)) return [];
   const entries: Entry[] = [];
@@ -39,29 +33,7 @@ function parseEntries(): Entry[] {
       const full = join(dir, name.name);
       if (name.isDirectory()) walk(full);
       else if (name.name.endsWith(".md")) {
-        const content = readFileSync(full, "utf8");
-        const blocks = content.split(/^## /m).filter((b) => b.trim());
-        for (const block of blocks) {
-          const lines = block.split("\n");
-          const header = lines[0]; // YYYY-MM-DD HH:MM
-          const m = header.match(/^(\d{4}-\d{2}-\d{2}) (\d{2}:\d{2})$/);
-          if (!m) continue;
-          const bodyLines = lines.slice(1);
-          const tags: string[] = [];
-          const bodyText: string[] = [];
-          for (const l of bodyLines) {
-            const tagMatch = l.matchAll(/#([a-zA-Z0-9_-]+)/g);
-            for (const t of tagMatch) tags.push(t[1].toLowerCase());
-            bodyText.push(l);
-          }
-          entries.push({
-            date: m[1],
-            time: m[2],
-            tags: [...new Set(tags)],
-            body: bodyText.join("\n").trimEnd(),
-            file: full,
-          });
-        }
+        entries.push(...parseDayFile(full, readFileSync(full, "utf8")));
       }
     }
   };
@@ -96,10 +68,10 @@ function cmdWrite(args: string[]) {
 
 function saveEntry(text: string) {
   const file = dayFile();
-  mkdirSync(join(file, ".."), { recursive: true });
-  const tagLine = [...text.matchAll(/#([a-zA-Z0-9_-]+)/g)].map((t) => t[1]);
+  mkdirSync(dirname(file), { recursive: true });
+  const tags = extractTags(text);
   let block = `\n## ${isoNow()} ${timeNow()}\n\n${text}\n`;
-  if (tagLine.length) block += `\nTags: ${[...new Set(tagLine.map((t) => t.toLowerCase()))].map((t) => `#${t}`).join(" ")}\n`;
+  if (tags.length) block += `\nTags: ${tags.map((t) => `#${t}`).join(" ")}\n`;
   appendFileSync(file, block);
   console.log(`Saved to ${file} at ${timeNow()}`);
 }
@@ -111,34 +83,44 @@ const TEMPLATE = [
   "#:",
 ];
 
-function cmdEditor() {
+function spawnEditor(editor: string, draft: string): number {
+  // EDITOR may contain arguments (e.g. "code -w"); run it through the user's
+  // shell with the draft path as "$@" so spaces and quoting are handled.
+  const shell = process.env.SHELL?.trim() || "/bin/sh";
+  const result = spawnSync(shell, ["-c", `${editor} "$@"`, "jrnl", draft], { stdio: "inherit" });
+  if (result.error) {
+    console.error(`Failed to launch editor "${editor}": ${result.error.message}`);
+    return 127;
+  }
+  return result.status ?? 1;
+}
+
+function cmdEditor(): number {
   const editor = process.env.EDITOR || process.env.VISUAL || "vi";
   const dir = mkdtempSync(join(tmpdir(), "jrnl-"));
   const draft = join(dir, "draft.md");
-  writeFileSync(draft, TEMPLATE.join("\n") + "\n");
-  const result = spawnSync(editor, [draft], { stdio: "inherit" });
-  if (result.status !== 0) {
+  try {
+    writeFileSync(draft, TEMPLATE.join("\n") + "\n");
+    const status = spawnEditor(editor, draft);
+    if (status !== 0) {
+      console.error(status === 127 ? `Editor not found: ${editor}` : `Editor exited with status ${status}; entry not saved.`);
+      return status;
+    }
+    const content = readFileSync(draft, "utf8");
+    const text = content
+      .split("\n")
+      .filter((l) => !l.trimStart().startsWith("#:"))
+      .join("\n")
+      .trim();
+    if (!text) {
+      console.log("Empty entry, nothing saved.");
+      return 0;
+    }
+    saveEntry(text);
+    return 0;
+  } finally {
     rmSync(dir, { recursive: true, force: true });
-    process.exit(result.status ?? 1);
   }
-  const content = readFileSync(draft, "utf8");
-  rmSync(dir, { recursive: true });
-  const text = content
-    .split("\n")
-    .filter((l) => !l.trimStart().startsWith("#:"))
-    .join("\n")
-    .trim();
-  if (!text) {
-    console.log("Empty entry, nothing saved.");
-    return;
-  }
-  saveEntry(text);
-}
-
-function matches(entry: Entry, term: string): boolean {
-  const t = term.toLowerCase();
-  if (t.startsWith("#")) return entry.tags.includes(t.slice(1));
-  return (entry.body + " " + entry.tags.join(" ")).toLowerCase().includes(t);
 }
 
 function printEntry(e: Entry) {
@@ -200,14 +182,23 @@ const usage = `jrnl — terminal journal
   jrnl list [n]         show last n entries (default 5)
   jrnl show [date]      show all entries for a date (default today)
   jrnl search <terms>   full-text search; "#tag" searches tags
-  jrnl tags             list all tags with counts`;
+  jrnl tags             list all tags with counts
+  jrnl --help           show this help`;
 
 switch (cmd) {
   case undefined:
-    cmdEditor();
+    if (process.stdin.isTTY) process.exit(cmdEditor());
+    else cmdWrite([]); // piped stdin is the entry text
     break;
   case "editor":
-    cmdEditor();
+    {
+      const code = cmdEditor();
+      if (code) process.exit(code);
+    }
+    break;
+  case "-h":
+  case "--help":
+    console.log(usage);
     break;
   case "write":
     cmdWrite(rest);
@@ -225,6 +216,11 @@ switch (cmd) {
     cmdTags();
     break;
   default:
-    if (!process.stdin.isTTY) cmdWrite(process.argv.slice(2));
+    // Never treat "-options" as entry text (e.g. piped `jrnl --future-flag`).
+    if (cmd.startsWith("-")) {
+      console.error(`Unknown option: ${cmd} (try jrnl --help)`);
+      process.exit(1);
+    }
+    if (!process.stdin.isTTY) cmdWrite([cmd, ...rest]);
     else console.log(usage);
 }

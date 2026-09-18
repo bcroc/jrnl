@@ -18,14 +18,14 @@ npm link        # optional: installs 'jrnl' as a global command
 ## Usage
 
 ```
-jrnl                   open $EDITOR to write an entry interactively
+jrnl                   open $EDITOR to write an entry interactively (TTY only)
 jrnl write <text>      add an entry inline (auto-dated; #tags supported)
 echo <text> | jrnl     add an entry via stdin (also: jrnl <text> when piped)
 jrnl list [n]          show last n entries (default 5)
 jrnl show [date]       show all entries for a date (default today; YYYY-MM-DD)
 jrnl search <terms>    full-text search; "#tag" searches by tag
 jrnl tags              list all tags with counts
-jrnl (no args/unknown) print usage
+jrnl --help            print usage
 ```
 
 ### Examples
@@ -45,8 +45,8 @@ jrnl list 10                           # 10 most recent entries
 
 - **Auto-dating**: every entry is stamped with `YYYY-MM-DD HH:MM` at write time (local time).
 - **Tags**: any `#token` (alphanumeric, `-`, `_`) inside the text is recognized; tags are lowercased and deduplicated. `jrnl search "#tag"` matches entries by tag.
-- **Editor mode** (`jrnl` with no args): spawns `$EDITOR`/`$VISUAL` (default `vi`) on a temp draft file. Lines beginning with `#:` are instruction lines and are stripped on save. Saving an empty draft writes nothing.
-- **Stdin mode**: if stdin is not a TTY (e.g. piped) and the subcommand is unrecognized, remaining args are treated as an entry.
+- **Editor mode** (`jrnl` with no args on a TTY): spawns `$EDITOR`/`$VISUAL` (default `vi`) on a temp draft file via the user's shell, so `EDITOR="code -w"` style values work. Lines beginning with `#:` are instruction lines and are stripped on save. Saving an empty draft writes nothing; a nonzero editor exit saves nothing and propagates the exit code.
+- **Stdin mode**: with piped stdin and no recognized subcommand, the piped text (plus any remaining args) is the entry. Unknown `-options` are rejected instead of saved (e.g. a future `jrnl --flag` can't silently become an entry).
 
 ## Storage Layout
 
@@ -79,17 +79,17 @@ Because files are plain Markdown, they work with `grep`, editors, and any backup
 
 ## Code Overview (`src/jrnl.ts`)
 
-Single-file TypeScript CLI (no external runtime deps).
+TypeScript CLI (no external runtime deps). Pure parsing/tag logic lives in `src/parse.ts` (`extractTags`, `parseDayFile`, `matches`); `src/jrnl.ts` holds the commands.
 
 | Function       | Purpose                                                                    |
 | -------------- | -------------------------------------------------------------------------- |
 | `isoNow` / `timeNow` | Current local date (`YYYY-MM-DD`) and time (`HH:MM`) strings          |
 | `dayFile`      | Path of a day's file: `JOURNAL_DIR/YYYY/MM/YYYY-MM-DD.md`                  |
-| `parseEntries` | Walks `JOURNAL_DIR`, reads `.md` files, splits on `^## ` blocks, parses headers/tags into `Entry[]` sorted chronologically |
+| `parseEntries` | Walks `JOURNAL_DIR`, reads `.md` files, delegates to `parseDayFile` (src/parse.ts); returns `Entry[]` sorted chronologically |
 | `readStdin`    | Blocking read of piped stdin                                               |
 | `cmdWrite`     | `write` command: inline args or stdin → `saveEntry`                        |
 | `saveEntry`    | Appends a timestamped block (plus `Tags:` line) to the day file            |
-| `cmdEditor`    | Bare invocation: temp draft seeded with `TEMPLATE`, spawned `$EDITOR`, strips `#:` lines, saves non-empty drafts |
+| `cmdEditor`    | Bare invocation: temp draft seeded with `TEMPLATE`, editor run through `$SHELL -c '<editor> "$@"'` (draft is `$1`), strips `#:` lines, saves non-empty drafts; always cleans up the temp dir |
 | `matches`      | Predicate: `#tag` → tag match; otherwise case-insensitive substring match  |
 | `cmdSearch`    | Multi-term AND search over all entries                                     |
 | `cmdList`      | One-line summaries of the n most recent entries                            |
@@ -100,6 +100,7 @@ Single-file TypeScript CLI (no external runtime deps).
 ## Development
 
 - **Build**: `npm run build` (TypeScript, `tsc`)
+- **Test**: `npm test` (builds, then runs the `node:test` suite in `src/parse.test.ts` — unit tests for parsing/tags plus end-to-end CLI runs against throwaway `JOURNAL_DIR`s)
 - **Run without build**: `npx tsx src/jrnl.ts` (if tsx is available) or rebuild first
 - **Verify**: e.g. `JOURNAL_DIR=$(mktemp -d) node dist/jrnl.js write "test #tag" && JOURNAL_DIR=$JOURNAL_DIR node dist/jrnl.js search "#tag"`
 

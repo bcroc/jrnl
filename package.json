@@ -2,12 +2,16 @@
   "name": "journaling",
   "version": "0.1.0",
   "description": "Terminal-based journaling tool with auto-dated markdown entries and search",
+  "engines": {
+    "node": ">=18"
+  },
   "type": "module",
   "bin": {
     "jrnl": "./dist/jrnl.js"
   },
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test dist/*.test.js",
     "start": "node dist/jrnl.js"
   },
   "devDependencies": {
