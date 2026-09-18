@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, readFileSync, readSync, existsSync, readdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, openSync, writeSync, fsyncSync, closeSync, readFileSync, readSync, existsSync, readdirSync, mkdtempSync, writeFileSync, rmSync, statSync, renameSync } from "node:fs";
+import type { BigIntStats } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -21,8 +22,73 @@ function dayFile(date = isoNow()): string {
   return join(JOURNAL_DIR, y, m, `${date}.md`);
 }
 
+// ---------------------------------------------------------------------------
+// WB-12 parse cache (src/parse.ts stays pure; caching is a filesystem concern).
+//
+// Key: per-file mtimeMs + size from readdir-with-stats. On a hit we skip
+// readFileSync + parseDayFile for that file; misses are parsed as before.
+// Cached skip-warnings and entry-less-file warnings are stored per file and
+// replayed on hit, so command output is identical with or without the cache.
+// Every failure path (missing cache, version mismatch, corrupt JSON, unwritable
+// dir, bad stats) degrades to a normal full reparse — the cache is best-effort
+// and must never make jrnl fail or change output.
+// ---------------------------------------------------------------------------
+
+interface CacheEntry {
+  // Validated against fresh statSync(bigint) on every run: a same-path rewrite
+  // (append via `jrnl write`, or a same-tick `jrnl edit`) changes one of them.
+  mtimeNs: string; // BigIntStats.mtimeNs as string (JSON can't hold bigint)
+  size: string;
+  entries: Entry[];
+  // Warnings from the cached parse, replayed on hit so stderr stays identical.
+  skipped: string[]; // "## <header>" for unparsed blocks
+  entryless: boolean; // file had non-empty content but zero parseable entries
+}
+
+interface CacheFile {
+  version: 1;
+  files: Record<string, CacheEntry>;
+}
+
+const CACHE_FILE = join(JOURNAL_DIR, ".jrnl-cache.json");
+const CACHE_VERSION = 1;
+
+function loadCache(): CacheFile {
+  try {
+    const parsed: unknown = JSON.parse(readFileSync(CACHE_FILE, "utf8"));
+    if (
+      parsed &&
+      typeof parsed === "object" &&
+      (parsed as CacheFile).version === CACHE_VERSION &&
+      typeof (parsed as CacheFile).files === "object"
+    ) {
+      return parsed as CacheFile;
+    }
+  } catch {
+    /* missing or corrupt cache = full reparse */
+  }
+  return { version: CACHE_VERSION, files: {} };
+}
+
+function saveCache(cache: CacheFile) {
+  // Atomic swap so a killed process can't leave a truncated cache; cache
+  // failures are always non-fatal.
+  try {
+    const tmp = join(JOURNAL_DIR, `.jrnl-cache.json.tmp-${process.pid}`);
+    writeFileSync(tmp, JSON.stringify(cache));
+    renameSync(tmp, CACHE_FILE);
+  } catch {
+    /* unwritable cache just means the next run reparses */
+  }
+}
+
 function parseEntries(): Entry[] {
   if (!existsSync(JOURNAL_DIR)) return [];
+
+  const cache = loadCache();
+  const nextCache: CacheFile = { version: CACHE_VERSION, files: {} };
+  // Only reuse (and persist) entries for files seen this run; stale paths
+  // self-evict because nextCache starts empty.
   const entries: Entry[] = [];
   const warned = new Set<string>();
   const warnOnce = (file: string, msg: string) => {
@@ -37,20 +103,56 @@ function parseEntries(): Entry[] {
       const full = join(dir, name.name);
       if (name.isDirectory()) walk(full);
       else if (name.name.endsWith(".md")) {
+        let st: BigIntStats;
+        try {
+          st = statSync(full, { bigint: true });
+        } catch {
+          // Vanished between readdir and stat: skip it this run.
+          continue;
+        }
+        const mtimeNs = st.mtimeNs.toString();
+        const size = st.size.toString();
+        // Keyed by path so two files can never cross-contaminate; mtime+size
+        // (nanosecond precision) inside the entry invalidates on any rewrite —
+        // including an append within the same clock tick (`jrnl edit`).
+        const cached = cache.files[full];
+        if (cached && cached.mtimeNs === mtimeNs && cached.size === size) {
+          // Replay this file's warnings in walk order, same as a fresh parse.
+          for (const header of cached.skipped) {
+            warnOnce(full, `skipping unparsed block in ${full}: "## ${header.slice(0, 60)}" (expected "## YYYY-MM-DD HH:MM")`);
+          }
+          if (cached.entryless) warnOnce(full, `${full} contains no journal entries`);
+          entries.push(...cached.entries);
+          nextCache.files[full] = cached;
+          continue;
+        }
         const content = readFileSync(full, "utf8");
         const before = entries.length;
-        entries.push(
-          ...parseDayFile(full, content, (header) =>
-            warnOnce(full, `skipping unparsed block in ${full}: "## ${header.slice(0, 60)}" (expected "## YYYY-MM-DD HH:MM")`)
-          )
-        );
-        if (content.trim() && entries.length === before) {
+        const skipped: string[] = [];
+        const parsed = parseDayFile(full, content, (header) => {
+          skipped.push(header);
+          warnOnce(full, `skipping unparsed block in ${full}: "## ${header.slice(0, 60)}" (expected "## YYYY-MM-DD HH:MM")`);
+        });
+        entries.push(...parsed);
+        const entryless = content.trim() !== "" && entries.length === before;
+        if (entryless) {
           warnOnce(full, `${full} contains no journal entries`);
         }
+        nextCache.files[full] = {
+          mtimeNs,
+          size,
+          entries: parsed,
+          skipped,
+          entryless,
+        };
       }
     }
   };
   walk(JOURNAL_DIR);
+  // Only persist when we actually saw .md files, so an empty journal dir is
+  // never polluted with a cache artifact; stale paths self-evict because
+  // nextCache starts empty each run.
+  if (Object.keys(nextCache.files).length) saveCache(nextCache);
   return entries.sort((a, b) => (a.date + a.time < b.date + b.time ? -1 : 1));
 }
 

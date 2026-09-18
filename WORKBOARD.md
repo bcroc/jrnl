@@ -28,7 +28,7 @@ Status: `[ ]` open · `[~]` in progress · `[x]` done
 
 ### Performance (low priority)
 
-- [ ] WB-12 Full reparse per query — every command reads and parses every `.md` file. Fine at personal scale (documented); if it bites, add an mtime-based cache or per-year index first.
+- [x] WB-12 Full reparse per query — done 2026-09-18: `parseEntries` (src/jrnl.ts) keeps an mtime+size-keyed parse cache at `JOURNAL_DIR/.jrnl-cache.json`; cache hits skip `readFileSync` + `parseDayFile` entirely (proven by a chmod-000 test), cached warnings are replayed so output is identical, every cache failure degrades to a full reparse, and empty journals get no cache file. Keyed by path with nanosecond mtime + size inside each entry, so same-tick rewrites still invalidate.
 
 ### Hygiene (minor)
 

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync, appendFileSync, chmodSync, existsSync, statSync, utimesSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -245,4 +245,100 @@ test("jrnl edit warns if editing introduces an unparsed block", (t) => {
   const edited = runIn(dir, ["edit"], { editor: '/bin/sh -c "printf \'\\n## Shopping list\\n\' >> $1"' });
   assert.equal(edited.status, 0);
   assert.match(edited.stderr, /unparsed block/);
+});
+
+// --- WB-12 mtime-keyed parse cache ---
+
+test("parse cache: second run is served from cache even when files are unreadable", (t) => {
+  // chmod 000 proves the hit path never reads the file: a fresh parse would
+  // throw EACCES, so this test fails if the cache is not actually used.
+  const { dir, status } = run(["write", "cache me #cached"], {});
+  const md = findMd(dir)[0];
+  t.after(() => {
+    try {
+      chmodSync(md, 0o644);
+    } catch {
+      /* file already gone */
+    }
+    rmSync(dir, { recursive: true, force: true });
+  });
+  assert.equal(status, 0);
+  const warm = runIn(dir, ["list"]); // run 2 populates the cache
+  assert.equal(warm.status, 0);
+  assert.match(warm.stdout, /cache me/);
+  chmodSync(md, 0o000);
+  const cold = runIn(dir, ["search", "#cached"]);
+  assert.equal(cold.status, 0, "cache hit must not re-read the file");
+  assert.match(cold.stdout, /cache me/);
+  assert.doesNotMatch(cold.stderr, /EACCES|permission/i);
+});
+
+test("parse cache: appended entry is picked up (mtime/size invalidation)", (t) => {
+  const { dir, status } = run(["write", "before #one"], {});
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(status, 0);
+  assert.match(runIn(dir, ["list"]).stdout, /before/); // warm the cache
+  const md = findMd(dir)[0];
+  appendFileSync(md, "\n## 2020-01-01 07:00\n\nappended by test #two\n");
+  const after = runIn(dir, ["list", "10"]);
+  assert.equal(after.status, 0);
+  assert.match(after.stdout, /appended by test/);
+  assert.match(after.stdout, /before/); // cache hit + fresh parse coexist
+});
+
+test("parse cache: same-tick rewrite with same content hash is detected via mtime+size", (t) => {
+  // A rewrite within the same clock tick keeps mtimeMs unchanged on most
+  // filesystems; nanosecond mtime + size must still invalidate.
+  const { dir, status } = run(["write", "original text #a"], {});
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(status, 0);
+  assert.match(runIn(dir, ["list"]).stdout, /original text/); // warm
+  const md = findMd(dir)[0];
+  const original = readFileSync(md, "utf8");
+  writeFileSync(md, original + "\n## 2020-01-01 06:00\n\nsame-tick append #b\n");
+  // keep the original mtime (same second, forced): size change must invalidate
+  const st = statSync(md);
+  const after = runIn(dir, ["list", "10"]);
+  assert.equal(after.status, 0);
+  assert.match(after.stdout, /same-tick append/);
+  assert.match(after.stdout, /original text/);
+  utimesSync(md, st.atime, st.mtime); // restore, no-op for assertions below
+});
+
+test("parse cache: corrupt cache file degrades to full reparse and rewrites cache", (t) => {
+  const { dir, status } = run(["write", "resilient #r"], {});
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(status, 0);
+  assert.match(runIn(dir, ["list"]).stdout, /resilient/); // warm
+  const cachePath = join(dir, ".jrnl-cache.json");
+  assert.ok(existsSync(cachePath));
+  writeFileSync(cachePath, "{corrupt json");
+  const after = runIn(dir, ["search", "#r"]);
+  assert.equal(after.status, 0, "corrupt cache must not fail the command");
+  assert.match(after.stdout, /resilient/);
+  const recovered = JSON.parse(readFileSync(cachePath, "utf8"));
+  assert.equal(recovered.version, 1);
+  assert.equal(Object.keys(recovered.files).length, 1);
+});
+
+test("parse cache: warnings from cached files are replayed identically", (t) => {
+  const { dir, status } = run(["write", "good #g"], {});
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  assert.equal(status, 0);
+  const md = findMd(dir)[0];
+  appendFileSync(md, "\n## Shopping list\n\nmilk\n");
+  const first = runIn(dir, ["list"]); // fresh parse: warns about unparsed block
+  assert.equal(first.status, 0);
+  assert.match(first.stderr, /unparsed block/);
+  const second = runIn(dir, ["list"]); // cached path must replay the warning
+  assert.equal(second.status, 0);
+  assert.match(second.stderr, /unparsed block/);
+});
+
+test("parse cache: no cache file is created for an empty journal", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "jrnl-test-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { status } = runIn(dir, ["list"]);
+  assert.equal(status, 0);
+  assert.ok(!existsSync(join(dir, ".jrnl-cache.json")));
 });

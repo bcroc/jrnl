@@ -54,6 +54,7 @@ jrnl list 10                           # 10 most recent entries
 - **Stdin mode**: with piped stdin and no recognized subcommand, the piped text (plus any remaining args) is the entry. Unknown `-options` are rejected instead of saved (e.g. a future `jrnl --flag` can't silently become an entry).
 - **Durability**: entries are written with a single append + `fsync`, so "Saved" means on disk. On write failure the entry text is echoed to stderr so nothing is silently lost.
 - **Warnings**: `.md` files in the journal that contain no parseable entries, and `## ` blocks whose header isn't `## YYYY-MM-DD HH:MM` (with a valid clock time), produce a warning on stderr — corrupt or hand-edited files can't silently vanish from search results.
+- **Parse cache**: after listing/searching, jrnl writes `JOURNAL_DIR/.jrnl-cache.json` keyed by file path + nanosecond mtime + size. Unchanged files skip re-reading and re-parsing on the next run; appended or edited files (even within the same second) invalidate automatically, warnings are replayed so output is identical, and any cache problem (missing, corrupt, unwritable) silently falls back to a full reparse. An empty journal gets no cache file. Deleting `.jrnl-cache.json` at any time is always safe.
 - **Editing**: `jrnl edit [date]` opens the day's file in `$EDITOR`/`$VISUAL` (same shell-wrapper behavior as editor mode). After the editor exits, jrnl reports if the number of parseable entries changed and warns about newly unparsable blocks.
 
 ## Storage Layout
@@ -93,7 +94,7 @@ TypeScript CLI (no external runtime deps). Pure parsing/tag logic lives in `src/
 | -------------- | -------------------------------------------------------------------------- |
 | `isoNow` / `timeNow` | Current local date (`YYYY-MM-DD`) and time (`HH:MM`) strings          |
 | `dayFile`      | Path of a day's file: `JOURNAL_DIR/YYYY/MM/YYYY-MM-DD.md`                  |
-| `parseEntries` | Walks `JOURNAL_DIR`, reads `.md` files, delegates to `parseDayFile` (src/parse.ts); returns `Entry[]` sorted chronologically |
+| `parseEntries` | Walks `JOURNAL_DIR`, reads `.md` files, delegates to `parseDayFile` (src/parse.ts); returns `Entry[]` sorted chronologically. Served from the mtime+size parse cache (`JOURNAL_DIR/.jrnl-cache.json`) when files are unchanged |
 | `readStdin`    | Blocking read of piped stdin                                               |
 | `cmdWrite`     | `write` command: inline args or stdin → `saveEntry`                        |
 | `saveEntry`    | Appends a timestamped block (plus `Tags:` line) to the day file            |
@@ -119,4 +120,4 @@ Pure helpers live in `src/parse.ts`: `resolveDate` maps `YYYY-MM-DD` / `today` /
 
 - Search is case-insensitive substring matching, not fuzzy or regex
 - No deleting of existing entries (editing exists via `jrnl edit`)
-- All entries are loaded into memory for each query (fine for personal scale)
+- All entries are loaded into memory for each query (fine for personal scale; unchanged files are served from the parse cache, see Behavior)
